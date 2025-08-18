@@ -1,0 +1,203 @@
+PER PULIRE DATASET
+
+'''# manual_reviewer.py
+import os, glob, csv
+import numpy as np
+import open3d as o3d
+
+# ====== CONFIG ======
+BIN_DIR      = "TofNetDataset/training/velodyne"   # cartella .bin
+LABEL_DIR    = "TofNetDataset/training/label_2"    # opzionale: cartella .txt (una riga con none/one_person/two_people)
+OPTIONAL_CSV = None  # es. "candidates_for_review.csv" con colonna frame_id; se None, prende tutti i .bin
+OUT_DECISIONS= "review_decisions.csv"
+
+POINT_SIZE   = 2.0
+# Asse "up" atteso (top-down): 'z' tipico per ToF overhead; puoi cambiarlo a runtime col tasto T
+DEFAULT_UP_AXIS = 'z'   # 'z' | 'y' | 'x'
+
+# ====== IO ======
+def load_bin_xyz(path):
+    pts = np.fromfile(path, dtype=np.float32)
+    if pts.size % 4 == 0:
+        return pts.reshape(-1,4)[:, :3]
+    return pts.reshape(-1,3)
+
+def read_label(path_txt):
+    if not os.path.exists(path_txt): return ""
+    try:
+        with open(path_txt, "r") as f:
+            s = f.read().strip()
+        return s
+    except:
+        return ""
+
+def load_frame_ids():
+    if OPTIONAL_CSV:
+        ids = []
+        with open(OPTIONAL_CSV, newline="", encoding="utf-8-sig") as f:
+            r = csv.DictReader(f)
+            # tollero header vari: frame_id, id, name
+            for row in r:
+                fid = row.get("frame_id") or row.get("id") or row.get("name")
+                if fid: ids.append(fid.strip())
+        # tieni solo quelli che esistono
+        ids = [fid for fid in ids if os.path.exists(os.path.join(BIN_DIR, f"{fid}.bin"))]
+        return ids
+    # altrimenti tutti i .bin
+    return [os.path.splitext(os.path.basename(p))[0] for p in sorted(glob.glob(os.path.join(BIN_DIR, "*.bin")))]
+
+# ====== GEOMETRIA / ORIENTAMENTO ======
+def rotation_quarter_around_axis(axis_char, k_quarters=1):
+    """Ritorna matrice 3x3 rotazione di +90° * k attorno all'asse scelto ('x'|'y'|'z')."""
+    k = k_quarters % 4
+    if k == 0:
+        return np.eye(3)
+    c, s = 0.0, 1.0  # per 90°
+    if axis_char == 'x':
+        R90 = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=float)
+    elif axis_char == 'y':
+        R90 = np.array([[0,0,1],[0,1,0],[-1,0,0]], dtype=float)
+    else:  # 'z'
+        R90 = np.array([[0,-1,0],[1,0,0],[0,0,1]], dtype=float)
+    R = np.eye(3)
+    for _ in range(k):
+        R = R @ R90
+    return R
+
+def topdown_params_for_up(up_axis):
+    """
+    Restituisce (front, up) per Open3D in modo da guardare dall'alto (top-down) rispetto all'asse up_axis.
+    front = direzione di vista della camera.
+    """
+    if up_axis == 'z':
+        # guardo lungo -Z, up verso +Y
+        return [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]
+    elif up_axis == 'y':
+        # guardo lungo -Y, up verso +Z
+        return [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]
+    else:  # 'x'
+        # guardo lungo -X, up verso +Z
+        return [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]
+
+# ====== VIEWER LOOP ======
+def main():
+    frame_ids = load_frame_ids()
+    if not frame_ids:
+        print("[ERR] Nessun frame trovato."); return
+
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(width=1000, height=800, visible=True)
+    ropt = vis.get_render_option()
+    ropt.point_size = POINT_SIZE
+    ropt.background_color = np.array([1,1,1])  # bianco; niente colori sui punti
+    # NB: non settiamo colori → default grigio/nero dei punti
+
+    pcd = o3d.geometry.PointCloud()
+    geom_added = False
+
+    idx = 0
+    up_axis = DEFAULT_UP_AXIS  # 'z'|'y'|'x'
+    rot_quarters = 0           # # di rotazioni 90° attorno all'asse "up" (per allineare quando serve)
+    decisions = {}             # fid -> dict(decision, up_axis, rot_quarters)
+
+    def set_view_topdown(pts_center):
+        front, up = topdown_params_for_up(up_axis)
+        ctr = vis.get_view_control()
+        ctr.set_front(front)
+        ctr.set_up(up)
+        ctr.set_lookat(pts_center.tolist())
+        ctr.set_zoom(0.6)
+
+    def load_current():
+        nonlocal geom_added
+        fid = frame_ids[idx]
+        bin_path = os.path.join(BIN_DIR, f"{fid}.bin")
+        lbl_path = os.path.join(LABEL_DIR, f"{fid}.txt")
+        pts = load_bin_xyz(bin_path)
+
+        # applica rotazioni 90° attorno all'asse up per riallineare rapidamente
+        if rot_quarters % 4 != 0:
+            R = rotation_quarter_around_axis(up_axis, rot_quarters)
+            pts = (pts @ R.T)
+
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        if not geom_added:
+            vis.add_geometry(pcd)
+            geom_added = True
+        else:
+            vis.update_geometry(pcd)
+
+        # centro per look-at
+        center = pts.mean(axis=0) if len(pts) else np.array([0,0,0], float)
+        set_view_topdown(center)
+
+        # stampa info riga
+        label_str = read_label(lbl_path)
+        print(f"[{idx+1}/{len(frame_ids)}] {fid}  label='{label_str}'  up={up_axis}  rot90={rot_quarters%4}")
+
+        vis.poll_events(); vis.update_renderer()
+
+    def save_and_quit():
+        with open(OUT_DECISIONS, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame_id","decision","up_axis","rot_quarters"])
+            for fid, d in decisions.items():
+                w.writerow([fid, d["decision"], d["up_axis"], d["rot_quarters"]])
+        print(f"[OK] Salvato {OUT_DECISIONS} ({len(decisions)} decisioni).")
+        vis.destroy_window()
+
+    def nav(delta):
+        nonlocal idx
+        idx = max(0, min(len(frame_ids)-1, idx + delta))
+        load_current()
+
+    def decide(dec):
+        fid = frame_ids[idx]
+        decisions[fid] = {"decision": dec, "up_axis": up_axis, "rot_quarters": rot_quarters % 4}
+
+        # 🔧 salva progressivamente
+        with open(OUT_DECISIONS, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame_id","decision","up_axis","rot_quarters"])
+            for ffid, d in decisions.items():
+                w.writerow([ffid, d["decision"], d["up_axis"], d["rot_quarters"]])
+
+        nav(+1)
+
+
+    # --- Key callbacks ---
+    vis.register_key_callback(ord('N'), lambda _: (nav(+1), False)[1])  # Next
+    vis.register_key_callback(ord('P'), lambda _: (nav(-1), False)[1])  # Prev
+    vis.register_key_callback(ord('K'), lambda _: (decide("K"), False)[1])  # Keep
+    vis.register_key_callback(ord('D'), lambda _: (decide("D"), False)[1])  # Discard
+    vis.register_key_callback(ord('S'), lambda _: (decide("S"), False)[1])  # Skip
+    def on_quit(_):
+        print("[INFO] Chiusura forzata, decisioni salvate in", OUT_DECISIONS)
+        vis.destroy_window()
+        return False
+
+    vis.register_key_callback(ord('Q'), on_quit)
+
+
+    def on_rotate(_):
+        nonlocal rot_quarters
+        rot_quarters += 1
+        load_current()
+        return False
+    vis.register_key_callback(ord('R'), on_rotate)  # ruota +90° attorno a up
+
+    def on_toggle_up(_):
+        nonlocal up_axis, rot_quarters
+        up_axis = {'z':'y','y':'x','x':'z'}[up_axis]  # cicla z→y→x→z
+        rot_quarters = 0  # azzera rotazione locale quando cambi sistema di riferimento
+        load_current()
+        return False
+    vis.register_key_callback(ord('T'), on_toggle_up)  # cambia asse "up" e reimposta topdown
+
+    # Carica primo
+    load_current()
+    vis.run()
+    save_and_quit()
+
+if __name__ == "__main__":
+    main()
